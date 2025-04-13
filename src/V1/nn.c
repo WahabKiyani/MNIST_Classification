@@ -3,6 +3,8 @@
 #include <math.h>
 #include <time.h>
 
+
+
 #define INPUT_SIZE 784
 #define HIDDEN_SIZE 128
 #define OUTPUT_SIZE 10
@@ -240,6 +242,7 @@ void freeNetwork(NeuralNetwork* net) {
 // Main function
 int main() {
     printf("MNIST Neural Network\n\n");
+    printf("\n");
 
     double** train_images = loadMNISTImages("data/train-images.idx3-ubyte", 60000);
     double** train_labels = loadMNISTLabels("data/train-labels.idx1-ubyte", 60000);
