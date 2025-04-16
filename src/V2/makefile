@@ -1,18 +1,18 @@
-# Compilers
+# # # Compilers
 
 NVCC = nvcc
 
 # Flags
 
-FLAGS = -O3 -Xcompiler -Wall,-Wextra,-ffast-math,-funroll-loops -pg
+FLAGS = -O2 -Xcompiler -Wall,-Wextra,-ffast-math,-funroll-loops -pg
 NVFLAGS = -gencode arch=compute_61,code=sm_61 \
           -gencode arch=compute_70,code=sm_70 \
           -gencode arch=compute_75,code=sm_75 \
           -gencode arch=compute_80,code=sm_80 \
           -gencode arch=compute_86,code=sm_86
 
-LDFLAGS = -lcublas -lcurand
-
+# LDFLAGS = -lcublas -lcurand
+LDFLAGS = -lcublas
 
 # Files
 SRC = nn.cu
@@ -48,3 +48,4 @@ gprof: $(EXE) | $(PROF_DIR)
 
 clean:
 	rm -rf $(BIN_DIR) $(PROF_DIR)
+

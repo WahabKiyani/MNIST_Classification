@@ -1,9 +1,3 @@
-#include <stdio.h>
-#include <stdlib.h>
-#include <math.h>
-#include <time.h>
-#include <cuda_runtime.h>
-
 #define INPUT_SIZE 784
 #define HIDDEN_SIZE 128
 #define OUTPUT_SIZE 10
@@ -11,6 +5,13 @@
 #define EPOCHS 3
 #define BATCH_SIZE 64
 #define BLOCK_SIZE 256
+#include <stdio.h>
+#include <stdlib.h>
+#include <math.h>
+#include <time.h>
+#include <cuda_runtime.h>
+#include <chrono>
+
 
 typedef struct {
     double* W1;  // Flattened [HIDDEN_SIZE][INPUT_SIZE]
@@ -31,6 +32,46 @@ typedef struct {
     double* d_d_hidden;
     double* d_target;
 } NeuralNetworkDevice;
+
+__global__ void softmax_kernel(double* input, double* output, int size) {
+    __shared__ double max_val;
+    __shared__ double sum;
+
+    int tid = threadIdx.x;
+
+    // Step 1: Find max value (numerical stability)
+    if (tid == 0) {
+        max_val = input[0];
+        for (int i = 1; i < size; i++) {
+            if (input[i] > max_val)
+                max_val = input[i];
+        }
+    }
+    __syncthreads();
+
+    // Step 2: Compute exponentials and sum
+    double val = exp(input[tid] - max_val);
+    output[tid] = val;
+
+    __syncthreads();
+
+    if (tid == 0) {
+        sum = 0.0;
+        for (int i = 0; i < size; i++) {
+            sum += output[i];
+        }
+    }
+    __syncthreads();
+
+    // Step 3: Normalize
+    output[tid] = output[tid] / sum;
+}
+
+void gpu_softmax(double* d_input, double* d_output, int size) {
+    softmax_kernel<<<1, size>>>(d_input, d_output, size);
+  //  cudaDeviceSynchronize(); // Optional for timing accuracy
+}
+
 
 __global__ void forward_hidden_layer(double* d_input, double* d_W1, double* d_b1, double* d_hidden) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -93,24 +134,7 @@ __global__ void update_weights_W1(double* d_W1, double* d_b1, double* d_input,
     }
 }
 
-double get_time(clock_t start) {
-    return (double)(clock() - start) / CLOCKS_PER_SEC;
-}
 
-void softmax(double* x, int size) {
-    double max_val = x[0];
-    for (int i = 1; i < size; i++) {
-        if (x[i] > max_val) max_val = x[i];
-    }
-    
-    double sum = 0;
-    for (int i = 0; i < size; i++) {
-        x[i] = exp(x[i] - max_val);
-        sum += x[i];
-    }
-    for (int i = 0; i < size; i++)
-        x[i] /= sum;
-}
 
 NeuralNetwork* createNetwork() {
     NeuralNetwork* net = (NeuralNetwork*)malloc(sizeof(NeuralNetwork));
@@ -171,7 +195,9 @@ void gpu_forward(NeuralNetworkDevice* dev_net, double* input, double* hidden, do
 
     cudaMemcpy(hidden, dev_net->d_hidden, HIDDEN_SIZE * sizeof(double), cudaMemcpyDeviceToHost);
     cudaMemcpy(output, dev_net->d_output, OUTPUT_SIZE * sizeof(double), cudaMemcpyDeviceToHost);
-    softmax(output, OUTPUT_SIZE);
+    gpu_softmax(dev_net->d_output, dev_net->d_output, OUTPUT_SIZE);
+
+
 }
 
 void gpu_backward(NeuralNetworkDevice* dev_net, double* input, double* target) {
@@ -201,13 +227,29 @@ void freeMatrix(double** mat, int rows) {
     free(mat);
 }
 
+
+
+
+
 void train(NeuralNetwork* net, NeuralNetworkDevice* dev_net, double** images, double** labels, int numImages) {
-    clock_t total_start = clock();
     double* hidden = (double*)malloc(HIDDEN_SIZE * sizeof(double));
     double* output = (double*)malloc(OUTPUT_SIZE * sizeof(double));
-    
+
+    // CUDA events for epoch timing
+    cudaEvent_t epoch_start, epoch_stop;
+    cudaEventCreate(&epoch_start);
+    cudaEventCreate(&epoch_stop);
+
+    // CUDA events for total training time
+    cudaEvent_t total_start, total_stop;
+    cudaEventCreate(&total_start);
+    cudaEventCreate(&total_stop);
+
+    cudaEventRecord(total_start, 0); 
+
     for (int epoch = 0; epoch < EPOCHS; epoch++) {
-        clock_t epoch_start = clock();
+        cudaEventRecord(epoch_start, 0);  
+
         double loss = 0.0;
         int correct = 0;
 
@@ -215,9 +257,9 @@ void train(NeuralNetwork* net, NeuralNetworkDevice* dev_net, double** images, do
             gpu_forward(dev_net, images[i], hidden, output);
             gpu_backward(dev_net, images[i], labels[i]);
 
-            for (int k = 0; k < OUTPUT_SIZE; k++) 
+            for (int k = 0; k < OUTPUT_SIZE; k++)
                 loss -= labels[i][k] * log(output[k] + 1e-10);
-            
+
             int pred = 0, actual = 0;
             for (int j = 0; j < OUTPUT_SIZE; j++) {
                 if (output[j] > output[pred]) pred = j;
@@ -226,13 +268,36 @@ void train(NeuralNetwork* net, NeuralNetworkDevice* dev_net, double** images, do
             if (pred == actual) correct++;
         }
 
-        printf("Epoch %d - Loss: %.4f - Train Accuracy: %.2f%% - Time: %.3fs\n",
-               epoch + 1, loss / numImages, (correct / (double)numImages) * 100, get_time(epoch_start));
+        cudaEventRecord(epoch_stop, 0);      
+        cudaEventSynchronize(epoch_stop);    
+
+        float epoch_ms = 0;
+        cudaEventElapsedTime(&epoch_ms, epoch_start, epoch_stop);
+        float epoch_sec = epoch_ms / 1000.0f;
+
+        printf("Epoch %d - Loss: %.4f - Train Accuracy: %.2f%% - Time: %.4f sec\n",
+               epoch + 1, loss / numImages, (correct / (double)numImages) * 100, epoch_sec);
     }
+
+    cudaEventRecord(total_stop, 0);    
+    cudaEventSynchronize(total_stop);
+
+    float total_ms = 0;
+    cudaEventElapsedTime(&total_ms, total_start, total_stop);
+    float total_sec = total_ms / 1000.0f;
+
+    printf("Total Training Time: %.4f sec\n", total_sec);
+
+    // Cleanup
+    cudaEventDestroy(epoch_start);
+    cudaEventDestroy(epoch_stop);
+    cudaEventDestroy(total_start);
+    cudaEventDestroy(total_stop);
+
     free(hidden);
     free(output);
-    printf("Total training time: %.3fs\n", get_time(total_start));
 }
+
 
 void evaluate(NeuralNetworkDevice* dev_net, double** images, double** labels, int numImages) {
     double* hidden = (double*)malloc(HIDDEN_SIZE * sizeof(double));
@@ -292,8 +357,8 @@ double** loadMNISTLabels(const char* filename, int numLabels) {
     }
     fclose(file);
     return labels;
-}
 
+}
 void freeNetwork(NeuralNetwork* net) {
     free(net->W1);
     free(net->W2);
