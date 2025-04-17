@@ -37,10 +37,7 @@ __global__ void softmax_kernel(double* input, double* output, int size) {
     __shared__ double max_val;
     __shared__ double sum;
 
-    int tid = threadIdx.x;
-
-    // Step 1: Find max value (numerical stability)
-    if (tid == 0) {
+    if (threadIdx.x == 0) {
         max_val = input[0];
         for (int i = 1; i < size; i++) {
             if (input[i] > max_val)
@@ -49,13 +46,13 @@ __global__ void softmax_kernel(double* input, double* output, int size) {
     }
     __syncthreads();
 
-    // Step 2: Compute exponentials and sum
-    double val = exp(input[tid] - max_val);
-    output[tid] = val;
-
+    int tid = threadIdx.x;
+    if (tid < size) {
+        output[tid] = exp(input[tid] - max_val);
+    }
     __syncthreads();
 
-    if (tid == 0) {
+    if (threadIdx.x == 0) {
         sum = 0.0;
         for (int i = 0; i < size; i++) {
             sum += output[i];
@@ -63,13 +60,15 @@ __global__ void softmax_kernel(double* input, double* output, int size) {
     }
     __syncthreads();
 
-    // Step 3: Normalize
-    output[tid] = output[tid] / sum;
+    if (tid < size) {
+        output[tid] /= sum + 1e-8;  
+    }
 }
+
 
 void gpu_softmax(double* d_input, double* d_output, int size) {
     softmax_kernel<<<1, size>>>(d_input, d_output, size);
-  //  cudaDeviceSynchronize(); // Optional for timing accuracy
+    cudaDeviceSynchronize(); 
 }
 
 
@@ -79,7 +78,7 @@ __global__ void forward_hidden_layer(double* d_input, double* d_W1, double* d_b1
         double sum = d_b1[i];
         for (int j = 0; j < INPUT_SIZE; j++)
             sum += d_W1[i * INPUT_SIZE + j] * d_input[j];
-        d_hidden[i] = (sum > 0) ? sum : 0.0;  // ReLU
+        d_hidden[i] = (sum > 0) ? sum : 0.0;  
     }
 }
 
@@ -106,7 +105,7 @@ __global__ void backward_hidden_layer(double* d_hidden, double* d_W2, double* d_
         double sum = 0.0;
         for (int j = 0; j < OUTPUT_SIZE; j++)
             sum += d_W2[j * HIDDEN_SIZE + i] * d_d_output[j];
-        d_d_hidden[i] = sum * ((d_hidden[i] > 0) ? 1.0 : 0.0);  // ReLU derivative
+        d_d_hidden[i] = sum * ((d_hidden[i] > 0) ? 1.0 : 0.0);  
     }
 }
 
@@ -194,8 +193,10 @@ void gpu_forward(NeuralNetworkDevice* dev_net, double* input, double* hidden, do
     forward_output_layer<<<gridSize_output, BLOCK_SIZE>>>(dev_net->d_hidden, dev_net->d_W2, dev_net->d_b2, dev_net->d_output);
 
     cudaMemcpy(hidden, dev_net->d_hidden, HIDDEN_SIZE * sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(output, dev_net->d_output, OUTPUT_SIZE * sizeof(double), cudaMemcpyDeviceToHost);
+    
     gpu_softmax(dev_net->d_output, dev_net->d_output, OUTPUT_SIZE);
+    cudaMemcpy(output, dev_net->d_output, OUTPUT_SIZE * sizeof(double), cudaMemcpyDeviceToHost);
+
 
 
 }
@@ -235,12 +236,12 @@ void train(NeuralNetwork* net, NeuralNetworkDevice* dev_net, double** images, do
     double* hidden = (double*)malloc(HIDDEN_SIZE * sizeof(double));
     double* output = (double*)malloc(OUTPUT_SIZE * sizeof(double));
 
-    // CUDA events for epoch timing
+   
     cudaEvent_t epoch_start, epoch_stop;
     cudaEventCreate(&epoch_start);
     cudaEventCreate(&epoch_stop);
 
-    // CUDA events for total training time
+   
     cudaEvent_t total_start, total_stop;
     cudaEventCreate(&total_start);
     cudaEventCreate(&total_stop);
@@ -288,7 +289,7 @@ void train(NeuralNetwork* net, NeuralNetworkDevice* dev_net, double** images, do
 
     printf("Total Training Time: %.4f sec\n", total_sec);
 
-    // Cleanup
+
     cudaEventDestroy(epoch_start);
     cudaEventDestroy(epoch_stop);
     cudaEventDestroy(total_start);
@@ -391,3 +392,4 @@ int main() {
     
     return 0;
 }
+
