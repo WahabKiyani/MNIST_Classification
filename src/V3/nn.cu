@@ -2,10 +2,10 @@
 #define HIDDEN_SIZE 128
 #define OUTPUT_SIZE 10
 #define LEARNING_RATE 0.01
-#define EPOCHS 3
-#define BATCH_SIZE 64
-#define BLOCK_SIZE 256
-#define NUM_STREAMS 32
+#define EPOCHS 3  
+#define BATCH_SIZE  128//256      //128 is Best size for Batch
+#define BLOCK_SIZE  256          //256 best so far
+#define NUM_STREAMS 64//32           // 64 best so far
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,35 +14,35 @@
 #include <cuda_runtime.h>
 #include <chrono>
 
+typedef float my_type;
+
 typedef struct {
-    double* W1;
-    double* W2;
-    double* b1;
-    double* b2;
+    my_type* W1;  
+    my_type* W2; 
+    my_type* b1;
+    my_type* b2;
 } NeuralNetwork;
 
 typedef struct {
-    double* d_W1;
-    double* d_W2;
-    double* d_b1;
-    double* d_b2;
-    
+    my_type* d_W1;
+    my_type* d_W2;
+    my_type* d_b1;
+    my_type* d_b2;
     
     struct {
         cudaStream_t stream;
-        double* d_input;
-        double* d_hidden;
-        double* d_output;
-        double* d_d_output;
-        double* d_d_hidden;
-        double* d_target;
+        my_type* d_input;
+        my_type* d_hidden;
+        my_type* d_output;
+        my_type* d_d_output;
+        my_type* d_d_hidden;
+        my_type* d_target;
     } streams[NUM_STREAMS];
 } NeuralNetworkDevice;
 
-
-__global__ void softmax_kernel(double* input, double* output, int size) {
-    __shared__ double max_val;
-    __shared__ double sum;
+__global__ void softmax_kernel(my_type* input, my_type* output, int size) {
+    __shared__ my_type max_val;
+    __shared__ my_type sum;
 
     if (threadIdx.x == 0) {
         max_val = input[0];
@@ -68,158 +68,118 @@ __global__ void softmax_kernel(double* input, double* output, int size) {
     __syncthreads();
 
     if (tid < size) {
-        output[tid] /= sum + 1e-8;  
+        output[tid] /= sum + 1e-8;
     }
 }
 
-void gpu_softmax(double* d_input, double* d_output, int size, cudaStream_t stream) {
-    softmax_kernel<<<1, size, 0, stream>>>(d_input, d_output, size);
-}
-
-__global__ void forward_hidden_layer_shared(double* d_input, double* d_W1, double* d_b1, double* d_hidden) {
-    __shared__ double shared_input[INPUT_SIZE];
+__global__ void forward_hidden_layer(my_type* d_input, my_type* d_W1, my_type* d_b1, my_type* d_hidden) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    
-    for (int idx = threadIdx.x; idx < INPUT_SIZE; idx += blockDim.x) {
-        shared_input[idx] = d_input[idx];
-    }
-    __syncthreads();
-
     if (i < HIDDEN_SIZE) {
-        double sum = d_b1[i];
+        my_type sum = d_b1[i];
         for (int j = 0; j < INPUT_SIZE; j++) {
-            sum += d_W1[i * INPUT_SIZE + j] * shared_input[j];
+            sum += d_W1[i * INPUT_SIZE + j] * d_input[j];
         }
-        d_hidden[i] = fmax(sum, 0.0);  
+        d_hidden[i] = fmaxf(sum, 0.0);
     }
 }
 
-__global__ void forward_output_layer_shared(double* d_hidden, double* d_W2, double* d_b2, double* d_output) {
-    __shared__ double shared_hidden[HIDDEN_SIZE];
+__global__ void forward_output_layer(my_type* d_hidden, my_type* d_W2, my_type* d_b2, my_type* d_output) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    
-    for (int idx = threadIdx.x; idx < HIDDEN_SIZE; idx += blockDim.x) {
-        shared_hidden[idx] = d_hidden[idx];
-    }
-    __syncthreads();
-
     if (i < OUTPUT_SIZE) {
-        double sum = d_b2[i];
+        my_type sum = d_b2[i];
         for (int j = 0; j < HIDDEN_SIZE; j++) {
-            sum += d_W2[i * HIDDEN_SIZE + j] * shared_hidden[j];
+            sum += d_W2[i * HIDDEN_SIZE + j] * d_hidden[j];
         }
         d_output[i] = sum;
     }
 }
 
-__global__ void update_weights_W2_shared(double* d_W2, double* d_b2, double* d_hidden, 
-                                       double* d_d_output, double lr) {
-    __shared__ double shared_hidden[HIDDEN_SIZE];
-    __shared__ double shared_d_output[OUTPUT_SIZE];
+__global__ void update_weights_W2(my_type* d_W2, my_type* d_b2, my_type* d_hidden, 
+                                my_type* d_d_output, my_type lr) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    
-
-    for (int idx = threadIdx.x; idx < HIDDEN_SIZE; idx += blockDim.x) {
-        shared_hidden[idx] = d_hidden[idx];
-    }
-    for (int idx = threadIdx.x; idx < OUTPUT_SIZE; idx += blockDim.x) {
-        shared_d_output[idx] = d_d_output[idx];
-    }
-    __syncthreads();
-
     if (i < OUTPUT_SIZE) {
-        double d_output_val = shared_d_output[i];
+        my_type d_output_val = d_d_output[i];
         for (int j = 0; j < HIDDEN_SIZE; j++) {
             int idx = i * HIDDEN_SIZE + j;
-            d_W2[idx] -= lr * d_output_val * shared_hidden[j];
+            d_W2[idx] -= lr * d_output_val * d_hidden[j];
         }
         d_b2[i] -= lr * d_output_val;
     }
 }
 
-__global__ void update_weights_W1_shared(double* d_W1, double* d_b1, double* d_input, 
-                                       double* d_d_hidden, double lr) {
-    __shared__ double shared_input[INPUT_SIZE];
-    __shared__ double shared_d_hidden[HIDDEN_SIZE];
+__global__ void update_weights_W1(my_type* d_W1, my_type* d_b1, my_type* d_input, 
+                                my_type* d_d_hidden, my_type lr) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
-    
-
-    for (int idx = threadIdx.x; idx < INPUT_SIZE; idx += blockDim.x) {
-        shared_input[idx] = d_input[idx];
-    }
-    for (int idx = threadIdx.x; idx < HIDDEN_SIZE; idx += blockDim.x) {
-        shared_d_hidden[idx] = d_d_hidden[idx];
-    }
-    __syncthreads();
-
     if (i < HIDDEN_SIZE) {
-        double d_hidden_val = shared_d_hidden[i];
+        my_type d_hidden_val = d_d_hidden[i];
         for (int j = 0; j < INPUT_SIZE; j++) {
             int idx = i * INPUT_SIZE + j;
-            d_W1[idx] -= lr * d_hidden_val * shared_input[j];
+            d_W1[idx] -= lr * d_hidden_val * d_input[j];
         }
         d_b1[i] -= lr * d_hidden_val;
     }
 }
 
-__global__ void backward_output_layer(double* d_output, double* d_target, double* d_d_output) {
+__global__ void backward_output_layer(my_type* d_output, my_type* d_target, my_type* d_d_output) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < OUTPUT_SIZE) {
         d_d_output[i] = d_output[i] - d_target[i];
     }
 }
 
-__global__ void backward_hidden_layer(double* d_hidden, double* d_W2, double* d_d_output, double* d_d_hidden) {
+__global__ void backward_hidden_layer(my_type* d_hidden, my_type* d_W2, my_type* d_d_output, my_type* d_d_hidden) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < HIDDEN_SIZE) {
-        double sum = 0.0;
+        my_type sum = 0.0;
         for (int j = 0; j < OUTPUT_SIZE; j++)
             sum += d_W2[j * HIDDEN_SIZE + i] * d_d_output[j];
-        d_d_hidden[i] = sum * ((d_hidden[i] > 0) ? 1.0 : 0.0); 
+        d_d_hidden[i] = sum * ((d_hidden[i] > 0) ? 1.0 : 0.0);
     }
 }
 
 NeuralNetwork* createNetwork() {
     NeuralNetwork* net = (NeuralNetwork*)malloc(sizeof(NeuralNetwork));
-    net->W1 = (double*)malloc(HIDDEN_SIZE * INPUT_SIZE * sizeof(double));
-    net->W2 = (double*)malloc(OUTPUT_SIZE * HIDDEN_SIZE * sizeof(double));
-    net->b1 = (double*)calloc(HIDDEN_SIZE, sizeof(double));
-    net->b2 = (double*)calloc(OUTPUT_SIZE, sizeof(double));
+    net->W1 = (my_type*)malloc(HIDDEN_SIZE * INPUT_SIZE * sizeof(my_type));
+    net->W2 = (my_type*)malloc(OUTPUT_SIZE * HIDDEN_SIZE * sizeof(my_type));
+    net->b1 = (my_type*)calloc(HIDDEN_SIZE, sizeof(my_type));
+    net->b2 = (my_type*)calloc(OUTPUT_SIZE, sizeof(my_type));
 
+    // Xavier/Glorot initialization
+    float stddev1 = sqrtf(2.0f / (INPUT_SIZE + HIDDEN_SIZE));
+    float stddev2 = sqrtf(2.0f / (HIDDEN_SIZE + OUTPUT_SIZE));
+    
     srand(time(NULL));
-    for (int i = 0; i < HIDDEN_SIZE * INPUT_SIZE; i++)
-        net->W1[i] = ((double)rand() / RAND_MAX) * 0.01;
+    for (int i = 0; i < HIDDEN_SIZE * INPUT_SIZE; i++) {
+        net->W1[i] = stddev1 * ((my_type)rand() / RAND_MAX - 0.5f);
+    }
 
-    for (int i = 0; i < OUTPUT_SIZE * HIDDEN_SIZE; i++)
-        net->W2[i] = ((double)rand() / RAND_MAX) * 0.01;
+    for (int i = 0; i < OUTPUT_SIZE * HIDDEN_SIZE; i++) {
+        net->W2[i] = stddev2 * ((my_type)rand() / RAND_MAX - 0.5f);
+    }
 
     return net;
 }
 
 void setupDeviceMemory(NeuralNetwork* net, NeuralNetworkDevice* dev_net) {
-    
-    cudaMalloc(&dev_net->d_W1, HIDDEN_SIZE * INPUT_SIZE * sizeof(double));
-    cudaMalloc(&dev_net->d_W2, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(double));
-    cudaMalloc(&dev_net->d_b1, HIDDEN_SIZE * sizeof(double));
-    cudaMalloc(&dev_net->d_b2, OUTPUT_SIZE * sizeof(double));
+    cudaMalloc(&dev_net->d_W1, HIDDEN_SIZE * INPUT_SIZE * sizeof(my_type));
+    cudaMalloc(&dev_net->d_W2, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(my_type));
+    cudaMalloc(&dev_net->d_b1, HIDDEN_SIZE * sizeof(my_type));
+    cudaMalloc(&dev_net->d_b2, OUTPUT_SIZE * sizeof(my_type));
 
+    cudaMemcpy(dev_net->d_W1, net->W1, HIDDEN_SIZE * INPUT_SIZE * sizeof(my_type), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_net->d_W2, net->W2, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(my_type), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_net->d_b1, net->b1, HIDDEN_SIZE * sizeof(my_type), cudaMemcpyHostToDevice);
+    cudaMemcpy(dev_net->d_b2, net->b2, OUTPUT_SIZE * sizeof(my_type), cudaMemcpyHostToDevice);
 
     for (int i = 0; i < NUM_STREAMS; i++) {
         cudaStreamCreate(&dev_net->streams[i].stream);
-        cudaMalloc(&dev_net->streams[i].d_input, INPUT_SIZE * sizeof(double));
-        cudaMalloc(&dev_net->streams[i].d_hidden, HIDDEN_SIZE * sizeof(double));
-        cudaMalloc(&dev_net->streams[i].d_output, OUTPUT_SIZE * sizeof(double));
-        cudaMalloc(&dev_net->streams[i].d_d_output, OUTPUT_SIZE * sizeof(double));
-        cudaMalloc(&dev_net->streams[i].d_d_hidden, HIDDEN_SIZE * sizeof(double));
-        cudaMalloc(&dev_net->streams[i].d_target, OUTPUT_SIZE * sizeof(double));
+        cudaMalloc(&dev_net->streams[i].d_input, INPUT_SIZE * sizeof(my_type));
+        cudaMalloc(&dev_net->streams[i].d_hidden, HIDDEN_SIZE * sizeof(my_type));
+        cudaMalloc(&dev_net->streams[i].d_output, OUTPUT_SIZE * sizeof(my_type));
+        cudaMalloc(&dev_net->streams[i].d_d_output, OUTPUT_SIZE * sizeof(my_type));
+        cudaMalloc(&dev_net->streams[i].d_d_hidden, HIDDEN_SIZE * sizeof(my_type));
+        cudaMalloc(&dev_net->streams[i].d_target, OUTPUT_SIZE * sizeof(my_type));
     }
-
-    cudaMemcpy(dev_net->d_W1, net->W1, HIDDEN_SIZE * INPUT_SIZE * sizeof(double), cudaMemcpyHostToDevice);
-    cudaMemcpy(dev_net->d_W2, net->W2, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(double), cudaMemcpyHostToDevice);
-    cudaMemcpy(dev_net->d_b1, net->b1, HIDDEN_SIZE * sizeof(double), cudaMemcpyHostToDevice);
-    cudaMemcpy(dev_net->d_b2, net->b2, OUTPUT_SIZE * sizeof(double), cudaMemcpyHostToDevice);
 }
 
 void freeDeviceMemory(NeuralNetworkDevice* dev_net) {
@@ -238,9 +198,105 @@ void freeDeviceMemory(NeuralNetworkDevice* dev_net) {
         cudaFree(dev_net->streams[i].d_target);
     }
 }
-void gpu_forward(NeuralNetworkDevice* dev_net, double* input, double* hidden, double* output, int stream_idx) {
+
+
+
+void gpu_softmax(my_type* d_input, my_type* d_output, int size, cudaStream_t stream) {
+    softmax_kernel<<<1, size, 0, stream>>>(d_input, d_output, size);
+}
+
+__global__ void forward_hidden_layer_shared(my_type* d_input, my_type* d_W1, my_type* d_b1, my_type* d_hidden) {
+    __shared__ my_type shared_input[INPUT_SIZE];
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    
+    for (int idx = threadIdx.x; idx < INPUT_SIZE; idx += blockDim.x) {
+        shared_input[idx] = d_input[idx];
+    }
+    __syncthreads();
+
+    if (i < HIDDEN_SIZE) {
+        my_type sum = d_b1[i];
+        for (int j = 0; j < INPUT_SIZE; j++) {
+            sum += d_W1[i * INPUT_SIZE + j] * shared_input[j];
+        }
+        d_hidden[i] = fmaxf(sum, 0.0);  
+    }
+}
+
+__global__ void forward_output_layer_shared(my_type* d_hidden, my_type* d_W2, my_type* d_b2, my_type* d_output) {
+    __shared__ my_type shared_hidden[HIDDEN_SIZE];
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    
+    for (int idx = threadIdx.x; idx < HIDDEN_SIZE; idx += blockDim.x) {
+        shared_hidden[idx] = d_hidden[idx];
+    }
+    __syncthreads();
+
+    if (i < OUTPUT_SIZE) {
+        my_type sum = d_b2[i];
+        for (int j = 0; j < HIDDEN_SIZE; j++) {
+            sum += d_W2[i * HIDDEN_SIZE + j] * shared_hidden[j];
+        }
+        d_output[i] = sum;
+    }
+}
+
+__global__ void update_weights_W2_shared(my_type* d_W2, my_type* d_b2, my_type* d_hidden, 
+                                       my_type* d_d_output, my_type lr) {
+    __shared__ my_type shared_hidden[HIDDEN_SIZE];
+    __shared__ my_type shared_d_output[OUTPUT_SIZE];
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+
+    for (int idx = threadIdx.x; idx < HIDDEN_SIZE; idx += blockDim.x) {
+        shared_hidden[idx] = d_hidden[idx];
+    }
+    for (int idx = threadIdx.x; idx < OUTPUT_SIZE; idx += blockDim.x) {
+        shared_d_output[idx] = d_d_output[idx];
+    }
+    __syncthreads();
+
+    if (i < OUTPUT_SIZE) {
+        my_type d_output_val = shared_d_output[i];
+        for (int j = 0; j < HIDDEN_SIZE; j++) {
+            int idx = i * HIDDEN_SIZE + j;
+            d_W2[idx] -= lr * d_output_val * shared_hidden[j];
+        }
+        d_b2[i] -= lr * d_output_val;
+    }
+}
+
+__global__ void update_weights_W1_shared(my_type* d_W1, my_type* d_b1, my_type* d_input, 
+                                       my_type* d_d_hidden, my_type lr) {
+    __shared__ my_type shared_input[INPUT_SIZE];
+    __shared__ my_type shared_d_hidden[HIDDEN_SIZE];
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    
+
+    for (int idx = threadIdx.x; idx < INPUT_SIZE; idx += blockDim.x) {
+        shared_input[idx] = d_input[idx];
+    }
+    for (int idx = threadIdx.x; idx < HIDDEN_SIZE; idx += blockDim.x) {
+        shared_d_hidden[idx] = d_d_hidden[idx];
+    }
+    __syncthreads();
+
+    if (i < HIDDEN_SIZE) {
+        my_type d_hidden_val = shared_d_hidden[i];
+        for (int j = 0; j < INPUT_SIZE; j++) {
+            int idx = i * INPUT_SIZE + j;
+            d_W1[idx] -= lr * d_hidden_val * shared_input[j];
+        }
+        d_b1[i] -= lr * d_hidden_val;
+    }
+}
+
+
+void gpu_forward(NeuralNetworkDevice* dev_net, my_type* input, my_type* hidden, my_type* output, int stream_idx) {
     cudaMemcpyAsync(dev_net->streams[stream_idx].d_input, input, 
-                   INPUT_SIZE * sizeof(double), cudaMemcpyHostToDevice,
+                   INPUT_SIZE * sizeof(my_type), cudaMemcpyHostToDevice,
                    dev_net->streams[stream_idx].stream);
 
     int gridSize_hidden = (HIDDEN_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -256,19 +312,19 @@ void gpu_forward(NeuralNetworkDevice* dev_net, double* input, double* hidden, do
                OUTPUT_SIZE, dev_net->streams[stream_idx].stream);
     
     cudaMemcpyAsync(hidden, dev_net->streams[stream_idx].d_hidden, 
-                   HIDDEN_SIZE * sizeof(double), cudaMemcpyDeviceToHost,
+                   HIDDEN_SIZE * sizeof(my_type), cudaMemcpyDeviceToHost,
                    dev_net->streams[stream_idx].stream);
     cudaMemcpyAsync(output, dev_net->streams[stream_idx].d_output, 
-                   OUTPUT_SIZE * sizeof(double), cudaMemcpyDeviceToHost,
+                   OUTPUT_SIZE * sizeof(my_type), cudaMemcpyDeviceToHost,
                    dev_net->streams[stream_idx].stream);
 }
 
-void gpu_backward(NeuralNetworkDevice* dev_net, double* input, double* target, int stream_idx) {
+void gpu_backward(NeuralNetworkDevice* dev_net, my_type* input, my_type* target, int stream_idx) {
     cudaMemcpyAsync(dev_net->streams[stream_idx].d_input, input, 
-                   INPUT_SIZE * sizeof(double), cudaMemcpyHostToDevice,
+                   INPUT_SIZE * sizeof(my_type), cudaMemcpyHostToDevice,
                    dev_net->streams[stream_idx].stream);
     cudaMemcpyAsync(dev_net->streams[stream_idx].d_target, target, 
-                   OUTPUT_SIZE * sizeof(double), cudaMemcpyHostToDevice,
+                   OUTPUT_SIZE * sizeof(my_type), cudaMemcpyHostToDevice,
                    dev_net->streams[stream_idx].stream);
 
     int gridSize_output = (OUTPUT_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE;
@@ -288,24 +344,24 @@ void gpu_backward(NeuralNetworkDevice* dev_net, double* input, double* target, i
 }
 
 
-double** allocateMatrix(int rows, int cols) {
-    double** mat = (double**)malloc(rows * sizeof(double*));
+my_type** allocateMatrix(int rows, int cols) {
+    my_type** mat = (my_type**)malloc(rows * sizeof(my_type*));
     for (int i = 0; i < rows; i++)
-        mat[i] = (double*)malloc(cols * sizeof(double));
+        mat[i] = (my_type*)malloc(cols * sizeof(my_type));
     return mat;
 }
 
-void freeMatrix(double** mat, int rows) {
+void freeMatrix(my_type** mat, int rows) {
     for (int i = 0; i < rows; i++)
         free(mat[i]);
     free(mat);
 }
-void train(NeuralNetwork* net, NeuralNetworkDevice* dev_net, double** images, double** labels, int numImages) {
+void train(NeuralNetwork* net, NeuralNetworkDevice* dev_net, my_type** images, my_type** labels, int numImages) {
     
-    double *hidden[NUM_STREAMS], *output[NUM_STREAMS];
+    my_type *hidden[NUM_STREAMS], *output[NUM_STREAMS];
     for (int i = 0; i < NUM_STREAMS; i++) {
-        cudaMallocHost(&hidden[i], HIDDEN_SIZE * sizeof(double));
-        cudaMallocHost(&output[i], OUTPUT_SIZE * sizeof(double));
+        cudaMallocHost(&hidden[i], HIDDEN_SIZE * sizeof(my_type));
+        cudaMallocHost(&output[i], OUTPUT_SIZE * sizeof(my_type));
     }
 
     
@@ -321,7 +377,7 @@ void train(NeuralNetwork* net, NeuralNetworkDevice* dev_net, double** images, do
         cudaEventCreate(&epoch_stop);
         cudaEventRecord(epoch_start);
 
-        double epoch_loss = 0;
+        my_type epoch_loss = 0;
         int correct = 0;
         
         for (int i = 0; i < numImages; i += NUM_STREAMS) {
@@ -390,11 +446,11 @@ void train(NeuralNetwork* net, NeuralNetworkDevice* dev_net, double** images, do
     cudaEventDestroy(total_stop);
 }
 
-void evaluate(NeuralNetworkDevice* dev_net, double** images, double** labels, int numImages) {
+void evaluate(NeuralNetworkDevice* dev_net, my_type** images, my_type** labels, int numImages) {
  
-    double *hidden, *output;
-    cudaMallocHost(&hidden, HIDDEN_SIZE * sizeof(double));
-    cudaMallocHost(&output, OUTPUT_SIZE * sizeof(double));
+    my_type *hidden, *output;
+    cudaMallocHost(&hidden, HIDDEN_SIZE * sizeof(my_type));
+    cudaMallocHost(&output, OUTPUT_SIZE * sizeof(my_type));
     
     int correct = 0;
     int stream_idx = 0; 
@@ -427,7 +483,7 @@ void evaluate(NeuralNetworkDevice* dev_net, double** images, double** labels, in
     cudaEventElapsedTime(&milliseconds, start, stop);
     
     printf("Test Accuracy: %.2f%% (Time: %.3fs)\n", 
-          (correct / (double)numImages) * 100, 
+          (correct / (my_type)numImages) * 100, 
           milliseconds / 1000.0f);
     
     
@@ -436,11 +492,11 @@ void evaluate(NeuralNetworkDevice* dev_net, double** images, double** labels, in
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 }
-double** loadMNISTImages(const char* filename, int numImages) {
+my_type** loadMNISTImages(const char* filename, int numImages) {
     FILE* file = fopen(filename, "rb");
     if (!file) { perror("Opening image file"); exit(1); }
     fseek(file, 16, SEEK_SET);
-    double** images = allocateMatrix(numImages, INPUT_SIZE);
+    my_type** images = allocateMatrix(numImages, INPUT_SIZE);
     for (int i = 0; i < numImages; i++) {
         for (int j = 0; j < INPUT_SIZE; j++) {
             unsigned char pixel;
@@ -456,11 +512,12 @@ double** loadMNISTImages(const char* filename, int numImages) {
     return images;
 }
 
-double** loadMNISTLabels(const char* filename, int numLabels) {
+
+my_type** loadMNISTLabels(const char* filename, int numLabels) {
     FILE* file = fopen(filename, "rb");
     if (!file) { perror("Opening label file"); exit(1); }
     fseek(file, 8, SEEK_SET);
-    double** labels = allocateMatrix(numLabels, OUTPUT_SIZE);
+    my_type** labels = allocateMatrix(numLabels, OUTPUT_SIZE);
     for (int i = 0; i < numLabels; i++) {
         unsigned char label;
         if (fread(&label, sizeof(unsigned char), 1, file) != 1) {
@@ -483,13 +540,14 @@ void freeNetwork(NeuralNetwork* net) {
     free(net);
 }
 
-int main() {
-    printf("MNIST Neural Network (Optimized CUDA with Streams)\n");
 
-    double** train_images = loadMNISTImages("data/train-images.idx3-ubyte", 60000);
-    double** train_labels = loadMNISTLabels("data/train-labels.idx1-ubyte", 60000);
-    double** test_images = loadMNISTImages("data/t10k-images.idx3-ubyte", 10000);
-    double** test_labels = loadMNISTLabels("data/t10k-labels.idx1-ubyte", 10000);
+int main() {
+    printf("MNIST Neural Network \n");
+
+    my_type** train_images = loadMNISTImages("data/train-images.idx3-ubyte", 60000);
+    my_type** train_labels = loadMNISTLabels("data/train-labels.idx1-ubyte", 60000);
+    my_type** test_images = loadMNISTImages("data/t10k-images.idx3-ubyte", 10000);
+    my_type** test_labels = loadMNISTLabels("data/t10k-labels.idx1-ubyte", 10000);
 
     NeuralNetwork* net = createNetwork();
     NeuralNetworkDevice dev_net;
