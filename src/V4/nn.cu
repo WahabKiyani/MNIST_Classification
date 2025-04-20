@@ -121,7 +121,37 @@ __global__ void half_to_float_kernel(const half_type* input, my_type* output, in
 }
 
 
+__global__ void softmax_kernel(my_type* input, my_type* output, int size) {
+    __shared__ my_type max_val;
+    __shared__ my_type sum;
 
+    if (threadIdx.x == 0) {
+        max_val = input[0];
+        for (int i = 1; i < size; i++) {
+            if (input[i] > max_val)
+                max_val = input[i];
+        }
+    }
+    __syncthreads();
+
+    int tid = threadIdx.x;
+    if (tid < size) {
+        output[tid] = exp(input[tid] - max_val);
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        sum = 0.0;
+        for (int i = 0; i < size; i++) {
+            sum += output[i];
+        }
+    }
+    __syncthreads();
+
+    if (tid < size) {
+        output[tid] /= sum + 1e-8;
+    }
+}
 
 
 __global__ void forward_hidden_layer_tensor(half_type* d_input, half_type* d_W1, my_type* d_b1, my_type* d_hidden) {
@@ -149,10 +179,47 @@ __global__ void forward_hidden_layer_tensor(half_type* d_input, half_type* d_W1,
 }
 
 
+__global__ void forward_output_layer_tensor(half_type* d_hidden, half_type* d_W2, my_type* d_b2, my_type* d_output) {
+    // Use tensor cores for the matrix multiplication
+    extern __shared__ half_type shared_hidden[];
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (threadIdx.x < HIDDEN_SIZE) {
+        shared_hidden[threadIdx.x] = d_hidden[threadIdx.x];
+    }
+    __syncthreads();
+
+    if (i < OUTPUT_SIZE) {
+    
+        my_type sum = d_b2[i];
+        
+   
+        for (int j = 0; j < HIDDEN_SIZE; j++) {
+            sum += __half2float(d_W2[i * HIDDEN_SIZE + j]) * __half2float(shared_hidden[j]);
+        }
+        
+        d_output[i] = sum;
+    }
+}
 
 
+__global__ void backward_output_layer(my_type* d_output, my_type* d_target, my_type* d_d_output) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < OUTPUT_SIZE) {
+        d_d_output[i] = d_output[i] - d_target[i];
+    }
+}
 
-
+__global__ void backward_hidden_layer(my_type* d_hidden, half_type* d_W2, my_type* d_d_output, my_type* d_d_hidden) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < HIDDEN_SIZE) {
+        my_type sum = 0.0f;
+        for (int j = 0; j < OUTPUT_SIZE; j++) {
+            sum += __half2float(d_W2[j * HIDDEN_SIZE + i]) * d_d_output[j];
+        }
+        d_d_hidden[i] = sum * ((d_hidden[i] > 0) ? 1.0f : 0.0f);  // ReLU derivative
+    }
+}
 
 
 __global__ void update_weights_W2(half_type* d_W2, my_type* d_b2, half_type* d_hidden, 
@@ -332,7 +399,70 @@ void gpu_forward(NeuralNetworkDevice* dev_net, my_type* input, my_type* hidden, 
                    OUTPUT_SIZE * sizeof(my_type), cudaMemcpyDeviceToHost, stream);
 }
 
+void gpu_backward(NeuralNetworkDevice* dev_net, my_type* input, my_type* target, int stream_idx) {
+    cudaStream_t stream = dev_net->streams[stream_idx].stream;
+    
+   
+    cudaMemcpyAsync(dev_net->streams[stream_idx].d_input, input, 
+                   INPUT_SIZE * sizeof(my_type), cudaMemcpyHostToDevice, stream);
+    cudaMemcpyAsync(dev_net->streams[stream_idx].d_target, target, 
+                   OUTPUT_SIZE * sizeof(my_type), cudaMemcpyHostToDevice, stream);
+    
+  
+    dim3 blockSize(256);
+    dim3 gridSize((INPUT_SIZE + blockSize.x - 1) / blockSize.x);
+    float_to_half_kernel<<<gridSize, blockSize, 0, stream>>>(
+        dev_net->streams[stream_idx].d_input, 
+        dev_net->streams[stream_idx].d_input_half, 
+        INPUT_SIZE
+    );
 
+
+    dim3 gridSize_output((OUTPUT_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    dim3 gridSize_hidden((HIDDEN_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE);
+    
+    backward_output_layer<<<gridSize_output, BLOCK_SIZE, 0, stream>>>(
+        dev_net->streams[stream_idx].d_output, 
+        dev_net->streams[stream_idx].d_target, 
+        dev_net->streams[stream_idx].d_d_output
+    );
+    
+    backward_hidden_layer<<<gridSize_hidden, BLOCK_SIZE, 0, stream>>>(
+        dev_net->streams[stream_idx].d_hidden, 
+        dev_net->d_W2_half, 
+        dev_net->streams[stream_idx].d_d_output, 
+        dev_net->streams[stream_idx].d_d_hidden
+    );
+
+
+    update_weights_W2<<<gridSize_output, BLOCK_SIZE, 0, stream>>>(
+        dev_net->d_W2_half, 
+        dev_net->d_b2, 
+        dev_net->streams[stream_idx].d_hidden_half, 
+        dev_net->streams[stream_idx].d_d_output, 
+        LEARNING_RATE
+    );
+    
+    update_weights_W1<<<gridSize_hidden, BLOCK_SIZE, 0, stream>>>(
+        dev_net->d_W1_half, 
+        dev_net->d_b1, 
+        dev_net->streams[stream_idx].d_input_half, 
+        dev_net->streams[stream_idx].d_d_hidden, 
+        LEARNING_RATE
+    );
+    
+
+    half_to_float_kernel<<<gridSize, blockSize, 0, stream>>>(
+        dev_net->d_W1_half, 
+        dev_net->d_W1, 
+        HIDDEN_SIZE * INPUT_SIZE
+    );
+    half_to_float_kernel<<<gridSize, blockSize, 0, stream>>>(
+        dev_net->d_W2_half, 
+        dev_net->d_W2, 
+        OUTPUT_SIZE * HIDDEN_SIZE
+    );
+}
 
 
 
