@@ -1,3 +1,4 @@
+
 #define INPUT_SIZE 784
 #define HIDDEN_SIZE 128
 #define OUTPUT_SIZE 10
@@ -16,6 +17,17 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <chrono>
+
+// CUDA error checking macro
+#define CUDA_CHECK(call) \
+do { \
+    cudaError_t err = (call); \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error at %s:%d code=%d(%s) \"%s\"\n", \
+                __FILE__, __LINE__, err, cudaGetErrorString(err), #call); \
+        exit(EXIT_FAILURE); \
+    } \
+} while (0)
 
 using namespace nvcuda;
 
@@ -50,53 +62,40 @@ typedef struct {
     } streams[NUM_STREAMS];
 } NeuralNetworkDevice;
 
-
 __global__ void warmup_tensor_cores() {
-  
     wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
     wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::col_major> b_frag;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc_frag;
     
-   
     wmma::fill_fragment(acc_frag, 0.0f);
     __syncthreads();
 }
 
-
 __global__ void tensor_matmul(const half_type* A, const half_type* B, my_type* C, 
                              int M, int N, int K) {
- 
     const int WMMA_M = 16;
     const int WMMA_N = 16;
     const int WMMA_K = 16;
-    
     
     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half_type, wmma::row_major> a_frag;
     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half_type, wmma::col_major> b_frag;
     wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, my_type> acc_frag;
     
- 
     wmma::fill_fragment(acc_frag, 0.0f);
     
-  
     for (int t = 0; t < (K + WMMA_K - 1) / WMMA_K; ++t) {
         int aRow = blockIdx.y * blockDim.y + threadIdx.y;
         int aCol = t * WMMA_K;
         int bRow = t * WMMA_K;
         int bCol = blockIdx.x * blockDim.x + threadIdx.x;
         
-      
         if (aRow < M && aCol < K && bRow < K && bCol < N) {
-          
             wmma::load_matrix_sync(a_frag, A + aRow * K + aCol, K);
             wmma::load_matrix_sync(b_frag, B + bRow * N + bCol, N);
-            
-          
             wmma::mma_sync(acc_frag, a_frag, b_frag, acc_frag);
         }
     }
     
-  
     int cRow = blockIdx.y * blockDim.y + threadIdx.y;
     int cCol = blockIdx.x * blockDim.x + threadIdx.x;
     
@@ -104,7 +103,6 @@ __global__ void tensor_matmul(const half_type* A, const half_type* B, my_type* C
         wmma::store_matrix_sync(C + cRow * N + cCol, acc_frag, N, wmma::mem_row_major);
     }
 }
-
 
 __global__ void float_to_half_kernel(const my_type* input, half_type* output, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -119,7 +117,6 @@ __global__ void half_to_float_kernel(const half_type* input, my_type* output, in
         output[idx] = __half2float(input[idx]);
     }
 }
-
 
 __global__ void softmax_kernel(my_type* input, my_type* output, int size) {
     __shared__ my_type max_val;
@@ -153,34 +150,25 @@ __global__ void softmax_kernel(my_type* input, my_type* output, int size) {
     }
 }
 
-
 __global__ void forward_hidden_layer_tensor(half_type* d_input, half_type* d_W1, my_type* d_b1, my_type* d_hidden) {
-    
     extern __shared__ half_type shared_input[];
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     
- 
     if (threadIdx.x < INPUT_SIZE) {
         shared_input[threadIdx.x] = d_input[threadIdx.x];
     }
     __syncthreads();
 
     if (i < HIDDEN_SIZE) {
-    
         my_type sum = d_b1[i];
-        
-        
         for (int j = 0; j < INPUT_SIZE; j++) {
             sum += __half2float(d_W1[i * INPUT_SIZE + j]) * __half2float(shared_input[j]);
         }
-        
-        d_hidden[i] = fmaxf(sum, 0.0f);  
+        d_hidden[i] = fmaxf(sum, 0.0f);
     }
 }
 
-
 __global__ void forward_output_layer_tensor(half_type* d_hidden, half_type* d_W2, my_type* d_b2, my_type* d_output) {
-    // Use tensor cores for the matrix multiplication
     extern __shared__ half_type shared_hidden[];
     int i = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -190,18 +178,13 @@ __global__ void forward_output_layer_tensor(half_type* d_hidden, half_type* d_W2
     __syncthreads();
 
     if (i < OUTPUT_SIZE) {
-    
         my_type sum = d_b2[i];
-        
-   
         for (int j = 0; j < HIDDEN_SIZE; j++) {
             sum += __half2float(d_W2[i * HIDDEN_SIZE + j]) * __half2float(shared_hidden[j]);
         }
-        
         d_output[i] = sum;
     }
 }
-
 
 __global__ void backward_output_layer(my_type* d_output, my_type* d_target, my_type* d_d_output) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -217,10 +200,9 @@ __global__ void backward_hidden_layer(my_type* d_hidden, half_type* d_W2, my_typ
         for (int j = 0; j < OUTPUT_SIZE; j++) {
             sum += __half2float(d_W2[j * HIDDEN_SIZE + i]) * d_d_output[j];
         }
-        d_d_hidden[i] = sum * ((d_hidden[i] > 0) ? 1.0f : 0.0f);  // ReLU derivative
+        d_d_hidden[i] = sum * ((d_hidden[i] > 0) ? 1.0f : 0.0f);
     }
 }
-
 
 __global__ void update_weights_W2(half_type* d_W2, my_type* d_b2, half_type* d_hidden, 
                                 my_type* d_d_output, my_type lr) {
@@ -254,11 +236,10 @@ __global__ void update_weights_W1(half_type* d_W1, my_type* d_b1, half_type* d_i
 
 NeuralNetwork* createNetwork() {
     NeuralNetwork* net = (NeuralNetwork*)malloc(sizeof(NeuralNetwork));
-    net->W1 = (my_type*)malloc(HIDDEN_SIZE * INPUT_SIZE * sizeof(my_type));
-    net->W2 = (my_type*)malloc(OUTPUT_SIZE * HIDDEN_SIZE * sizeof(my_type));
-    net->b1 = (my_type*)calloc(HIDDEN_SIZE, sizeof(my_type));
-    net->b2 = (my_type*)calloc(OUTPUT_SIZE, sizeof(my_type));
-
+    CUDA_CHECK(cudaMallocHost(&net->W1, HIDDEN_SIZE * INPUT_SIZE * sizeof(my_type)));
+    CUDA_CHECK(cudaMallocHost(&net->W2, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(my_type)));
+    CUDA_CHECK(cudaMallocHost(&net->b1, HIDDEN_SIZE * sizeof(my_type)));
+    CUDA_CHECK(cudaMallocHost(&net->b2, OUTPUT_SIZE * sizeof(my_type)));
 
     float stddev1 = sqrtf(2.0f / (INPUT_SIZE + HIDDEN_SIZE));
     float stddev2 = sqrtf(2.0f / (HIDDEN_SIZE + OUTPUT_SIZE));
@@ -276,84 +257,81 @@ NeuralNetwork* createNetwork() {
 }
 
 void setupDeviceMemory(NeuralNetwork* net, NeuralNetworkDevice* dev_net) {
-   
-    cudaMalloc(&dev_net->d_W1, HIDDEN_SIZE * INPUT_SIZE * sizeof(my_type));
-    cudaMalloc(&dev_net->d_W2, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(my_type));
-    cudaMalloc(&dev_net->d_b1, HIDDEN_SIZE * sizeof(my_type));
-    cudaMalloc(&dev_net->d_b2, OUTPUT_SIZE * sizeof(my_type));
+    CUDA_CHECK(cudaMalloc(&dev_net->d_W1, HIDDEN_SIZE * INPUT_SIZE * sizeof(my_type)));
+    CUDA_CHECK(cudaMalloc(&dev_net->d_W2, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(my_type)));
+    CUDA_CHECK(cudaMalloc(&dev_net->d_b1, HIDDEN_SIZE * sizeof(my_type)));
+    CUDA_CHECK(cudaMalloc(&dev_net->d_b2, OUTPUT_SIZE * sizeof(my_type)));
 
+    CUDA_CHECK(cudaMalloc(&dev_net->d_W1_half, HIDDEN_SIZE * INPUT_SIZE * sizeof(half_type)));
+    CUDA_CHECK(cudaMalloc(&dev_net->d_W2_half, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(half_type)));
 
-    cudaMalloc(&dev_net->d_W1_half, HIDDEN_SIZE * INPUT_SIZE * sizeof(half_type));
-    cudaMalloc(&dev_net->d_W2_half, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(half_type));
-
-
-    cudaMemcpy(dev_net->d_W1, net->W1, HIDDEN_SIZE * INPUT_SIZE * sizeof(my_type), cudaMemcpyHostToDevice);
-    cudaMemcpy(dev_net->d_W2, net->W2, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(my_type), cudaMemcpyHostToDevice);
-    cudaMemcpy(dev_net->d_b1, net->b1, HIDDEN_SIZE * sizeof(my_type), cudaMemcpyHostToDevice);
-    cudaMemcpy(dev_net->d_b2, net->b2, OUTPUT_SIZE * sizeof(my_type), cudaMemcpyHostToDevice);
-
+    CUDA_CHECK(cudaMemcpy(dev_net->d_W1, net->W1, HIDDEN_SIZE * INPUT_SIZE * sizeof(my_type), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dev_net->d_W2, net->W2, OUTPUT_SIZE * HIDDEN_SIZE * sizeof(my_type), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dev_net->d_b1, net->b1, HIDDEN_SIZE * sizeof(my_type), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dev_net->d_b2, net->b2, OUTPUT_SIZE * sizeof(my_type), cudaMemcpyHostToDevice));
 
     dim3 blockSize(256);
     dim3 gridSizeW1((HIDDEN_SIZE * INPUT_SIZE + blockSize.x - 1) / blockSize.x);
     dim3 gridSizeW2((OUTPUT_SIZE * HIDDEN_SIZE + blockSize.x - 1) / blockSize.x);
     
     float_to_half_kernel<<<gridSizeW1, blockSize>>>(dev_net->d_W1, dev_net->d_W1_half, HIDDEN_SIZE * INPUT_SIZE);
+    CUDA_CHECK(cudaGetLastError());
     float_to_half_kernel<<<gridSizeW2, blockSize>>>(dev_net->d_W2, dev_net->d_W2_half, OUTPUT_SIZE * HIDDEN_SIZE);
-    cudaDeviceSynchronize();
-
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaDeviceSynchronize());
 
     for (int i = 0; i < NUM_STREAMS; i++) {
-        cudaStreamCreate(&dev_net->streams[i].stream);
-        cudaMalloc(&dev_net->streams[i].d_input, INPUT_SIZE * sizeof(my_type));
-        cudaMalloc(&dev_net->streams[i].d_input_half, INPUT_SIZE * sizeof(half_type));
-        cudaMalloc(&dev_net->streams[i].d_hidden, HIDDEN_SIZE * sizeof(my_type));
-        cudaMalloc(&dev_net->streams[i].d_hidden_half, HIDDEN_SIZE * sizeof(half_type));
-        cudaMalloc(&dev_net->streams[i].d_output, OUTPUT_SIZE * sizeof(my_type));
-        cudaMalloc(&dev_net->streams[i].d_d_output, OUTPUT_SIZE * sizeof(my_type));
-        cudaMalloc(&dev_net->streams[i].d_d_hidden, HIDDEN_SIZE * sizeof(my_type));
-        cudaMalloc(&dev_net->streams[i].d_target, OUTPUT_SIZE * sizeof(my_type));
+        CUDA_CHECK(cudaStreamCreate(&dev_net->streams[i].stream));
+        CUDA_CHECK(cudaMalloc(&dev_net->streams[i].d_input, INPUT_SIZE * sizeof(my_type)));
+        CUDA_CHECK(cudaMalloc(&dev_net->streams[i].d_input_half, INPUT_SIZE * sizeof(half_type)));
+        CUDA_CHECK(cudaMalloc(&dev_net->streams[i].d_hidden, HIDDEN_SIZE * sizeof(my_type)));
+        CUDA_CHECK(cudaMalloc(&dev_net->streams[i].d_hidden_half, HIDDEN_SIZE * sizeof(half_type)));
+        CUDA_CHECK(cudaMalloc(&dev_net->streams[i].d_output, OUTPUT_SIZE * sizeof(my_type)));
+        CUDA_CHECK(cudaMalloc(&dev_net->streams[i].d_d_output, OUTPUT_SIZE * sizeof(my_type)));
+        CUDA_CHECK(cudaMalloc(&dev_net->streams[i].d_d_hidden, HIDDEN_SIZE * sizeof(my_type)));
+        CUDA_CHECK(cudaMalloc(&dev_net->streams[i].d_target, OUTPUT_SIZE * sizeof(my_type)));
     }
-
 
     printf("Warming up tensor cores...\n");
     for (int i = 0; i < WARMUP_ITERATIONS; i++) {
         warmup_tensor_cores<<<1, 32>>>();
+        CUDA_CHECK(cudaGetLastError());
     }
-    cudaDeviceSynchronize();
+    CUDA_CHECK(cudaDeviceSynchronize());
     printf("Tensor cores warmed up\n");
 }
 
 void freeDeviceMemory(NeuralNetworkDevice* dev_net) {
-    cudaFree(dev_net->d_W1);
-    cudaFree(dev_net->d_W2);
-    cudaFree(dev_net->d_b1);
-    cudaFree(dev_net->d_b2);
-    cudaFree(dev_net->d_W1_half);
-    cudaFree(dev_net->d_W2_half);
+    CUDA_CHECK(cudaFree(dev_net->d_W1));
+    CUDA_CHECK(cudaFree(dev_net->d_W2));
+    CUDA_CHECK(cudaFree(dev_net->d_b1));
+    CUDA_CHECK(cudaFree(dev_net->d_b2));
+    CUDA_CHECK(cudaFree(dev_net->d_W1_half));
+    CUDA_CHECK(cudaFree(dev_net->d_W2_half));
 
     for (int i = 0; i < NUM_STREAMS; i++) {
-        cudaStreamDestroy(dev_net->streams[i].stream);
-        cudaFree(dev_net->streams[i].d_input);
-        cudaFree(dev_net->streams[i].d_input_half);
-        cudaFree(dev_net->streams[i].d_hidden);
-        cudaFree(dev_net->streams[i].d_hidden_half);
-        cudaFree(dev_net->streams[i].d_output);
-        cudaFree(dev_net->streams[i].d_d_output);
-        cudaFree(dev_net->streams[i].d_d_hidden);
-        cudaFree(dev_net->streams[i].d_target);
+        CUDA_CHECK(cudaStreamDestroy(dev_net->streams[i].stream));
+        CUDA_CHECK(cudaFree(dev_net->streams[i].d_input));
+        CUDA_CHECK(cudaFree(dev_net->streams[i].d_input_half));
+        CUDA_CHECK(cudaFree(dev_net->streams[i].d_hidden));
+        CUDA_CHECK(cudaFree(dev_net->streams[i].d_hidden_half));
+        CUDA_CHECK(cudaFree(dev_net->streams[i].d_output));
+        CUDA_CHECK(cudaFree(dev_net->streams[i].d_d_output));
+        CUDA_CHECK(cudaFree(dev_net->streams[i].d_d_hidden));
+        CUDA_CHECK(cudaFree(dev_net->streams[i].d_target));
     }
 }
 
 void gpu_softmax(my_type* d_input, my_type* d_output, int size, cudaStream_t stream) {
     softmax_kernel<<<1, size, 0, stream>>>(d_input, d_output, size);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void gpu_forward(NeuralNetworkDevice* dev_net, my_type* input, my_type* hidden, my_type* output, int stream_idx) {
     cudaStream_t stream = dev_net->streams[stream_idx].stream;
     
-
-    cudaMemcpyAsync(dev_net->streams[stream_idx].d_input, input, 
-                   INPUT_SIZE * sizeof(my_type), cudaMemcpyHostToDevice, stream);
+    CUDA_CHECK(cudaMemcpyAsync(dev_net->streams[stream_idx].d_input, input, 
+                   INPUT_SIZE * sizeof(my_type), cudaMemcpyHostToDevice, stream));
     
     dim3 blockSize(256);
     dim3 gridSize((INPUT_SIZE + blockSize.x - 1) / blockSize.x);
@@ -362,7 +340,7 @@ void gpu_forward(NeuralNetworkDevice* dev_net, my_type* input, my_type* hidden, 
         dev_net->streams[stream_idx].d_input_half, 
         INPUT_SIZE
     );
-
+    CUDA_CHECK(cudaGetLastError());
   
     dim3 gridSize_hidden((HIDDEN_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE);
     forward_hidden_layer_tensor<<<gridSize_hidden, BLOCK_SIZE, INPUT_SIZE * sizeof(half_type), stream>>>(
@@ -371,14 +349,14 @@ void gpu_forward(NeuralNetworkDevice* dev_net, my_type* input, my_type* hidden, 
         dev_net->d_b1, 
         dev_net->streams[stream_idx].d_hidden
     );
-
+    CUDA_CHECK(cudaGetLastError());
    
     float_to_half_kernel<<<gridSize, blockSize, 0, stream>>>(
         dev_net->streams[stream_idx].d_hidden,
         dev_net->streams[stream_idx].d_hidden_half,
         HIDDEN_SIZE
     );
-
+    CUDA_CHECK(cudaGetLastError());
  
     dim3 gridSize_output((OUTPUT_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE);
     forward_output_layer_tensor<<<gridSize_output, BLOCK_SIZE, HIDDEN_SIZE * sizeof(half_type), stream>>>(
@@ -387,28 +365,25 @@ void gpu_forward(NeuralNetworkDevice* dev_net, my_type* input, my_type* hidden, 
         dev_net->d_b2,
         dev_net->streams[stream_idx].d_output
     );
-
+    CUDA_CHECK(cudaGetLastError());
  
     gpu_softmax(dev_net->streams[stream_idx].d_output, dev_net->streams[stream_idx].d_output, 
                OUTPUT_SIZE, stream);
     
-
-    cudaMemcpyAsync(hidden, dev_net->streams[stream_idx].d_hidden, 
-                   HIDDEN_SIZE * sizeof(my_type), cudaMemcpyDeviceToHost, stream);
-    cudaMemcpyAsync(output, dev_net->streams[stream_idx].d_output, 
-                   OUTPUT_SIZE * sizeof(my_type), cudaMemcpyDeviceToHost, stream);
+    CUDA_CHECK(cudaMemcpyAsync(hidden, dev_net->streams[stream_idx].d_hidden, 
+                   HIDDEN_SIZE * sizeof(my_type), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(output, dev_net->streams[stream_idx].d_output, 
+                   OUTPUT_SIZE * sizeof(my_type), cudaMemcpyDeviceToHost, stream));
 }
 
 void gpu_backward(NeuralNetworkDevice* dev_net, my_type* input, my_type* target, int stream_idx) {
     cudaStream_t stream = dev_net->streams[stream_idx].stream;
     
-   
-    cudaMemcpyAsync(dev_net->streams[stream_idx].d_input, input, 
-                   INPUT_SIZE * sizeof(my_type), cudaMemcpyHostToDevice, stream);
-    cudaMemcpyAsync(dev_net->streams[stream_idx].d_target, target, 
-                   OUTPUT_SIZE * sizeof(my_type), cudaMemcpyHostToDevice, stream);
+    CUDA_CHECK(cudaMemcpyAsync(dev_net->streams[stream_idx].d_input, input, 
+                   INPUT_SIZE * sizeof(my_type), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemcpyAsync(dev_net->streams[stream_idx].d_target, target, 
+                   OUTPUT_SIZE * sizeof(my_type), cudaMemcpyHostToDevice, stream));
     
-  
     dim3 blockSize(256);
     dim3 gridSize((INPUT_SIZE + blockSize.x - 1) / blockSize.x);
     float_to_half_kernel<<<gridSize, blockSize, 0, stream>>>(
@@ -416,7 +391,7 @@ void gpu_backward(NeuralNetworkDevice* dev_net, my_type* input, my_type* target,
         dev_net->streams[stream_idx].d_input_half, 
         INPUT_SIZE
     );
-
+    CUDA_CHECK(cudaGetLastError());
 
     dim3 gridSize_output((OUTPUT_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE);
     dim3 gridSize_hidden((HIDDEN_SIZE + BLOCK_SIZE - 1) / BLOCK_SIZE);
@@ -426,6 +401,7 @@ void gpu_backward(NeuralNetworkDevice* dev_net, my_type* input, my_type* target,
         dev_net->streams[stream_idx].d_target, 
         dev_net->streams[stream_idx].d_d_output
     );
+    CUDA_CHECK(cudaGetLastError());
     
     backward_hidden_layer<<<gridSize_hidden, BLOCK_SIZE, 0, stream>>>(
         dev_net->streams[stream_idx].d_hidden, 
@@ -433,7 +409,7 @@ void gpu_backward(NeuralNetworkDevice* dev_net, my_type* input, my_type* target,
         dev_net->streams[stream_idx].d_d_output, 
         dev_net->streams[stream_idx].d_d_hidden
     );
-
+    CUDA_CHECK(cudaGetLastError());
 
     update_weights_W2<<<gridSize_output, BLOCK_SIZE, 0, stream>>>(
         dev_net->d_W2_half, 
@@ -442,6 +418,7 @@ void gpu_backward(NeuralNetworkDevice* dev_net, my_type* input, my_type* target,
         dev_net->streams[stream_idx].d_d_output, 
         LEARNING_RATE
     );
+    CUDA_CHECK(cudaGetLastError());
     
     update_weights_W1<<<gridSize_hidden, BLOCK_SIZE, 0, stream>>>(
         dev_net->d_W1_half, 
@@ -450,21 +427,21 @@ void gpu_backward(NeuralNetworkDevice* dev_net, my_type* input, my_type* target,
         dev_net->streams[stream_idx].d_d_hidden, 
         LEARNING_RATE
     );
+    CUDA_CHECK(cudaGetLastError());
     
-
     half_to_float_kernel<<<gridSize, blockSize, 0, stream>>>(
         dev_net->d_W1_half, 
         dev_net->d_W1, 
         HIDDEN_SIZE * INPUT_SIZE
     );
+    CUDA_CHECK(cudaGetLastError());
     half_to_float_kernel<<<gridSize, blockSize, 0, stream>>>(
         dev_net->d_W2_half, 
         dev_net->d_W2, 
         OUTPUT_SIZE * HIDDEN_SIZE
     );
+    CUDA_CHECK(cudaGetLastError());
 }
-
-
 
 my_type** allocateMatrix(int rows, int cols) {
     my_type** mat = (my_type**)malloc(rows * sizeof(my_type*));
@@ -482,20 +459,20 @@ void freeMatrix(my_type** mat, int rows) {
 void train(NeuralNetwork* net, NeuralNetworkDevice* dev_net, my_type** images, my_type** labels, int numImages) {
     my_type *hidden[NUM_STREAMS], *output[NUM_STREAMS];
     for (int i = 0; i < NUM_STREAMS; i++) {
-        cudaMallocHost(&hidden[i], HIDDEN_SIZE * sizeof(my_type));
-        cudaMallocHost(&output[i], OUTPUT_SIZE * sizeof(my_type));
+        CUDA_CHECK(cudaMallocHost(&hidden[i], HIDDEN_SIZE * sizeof(my_type)));
+        CUDA_CHECK(cudaMallocHost(&output[i], OUTPUT_SIZE * sizeof(my_type)));
     }
 
     cudaEvent_t total_start, total_stop;
-    cudaEventCreate(&total_start);
-    cudaEventCreate(&total_stop);
-    cudaEventRecord(total_start);
+    CUDA_CHECK(cudaEventCreate(&total_start));
+    CUDA_CHECK(cudaEventCreate(&total_stop));
+    CUDA_CHECK(cudaEventRecord(total_start));
 
     for (int epoch = 0; epoch < EPOCHS; epoch++) {
         cudaEvent_t epoch_start, epoch_stop;
-        cudaEventCreate(&epoch_start);
-        cudaEventCreate(&epoch_stop);
-        cudaEventRecord(epoch_start);
+        CUDA_CHECK(cudaEventCreate(&epoch_start));
+        CUDA_CHECK(cudaEventCreate(&epoch_stop));
+        CUDA_CHECK(cudaEventRecord(epoch_start));
 
         my_type epoch_loss = 0;
         int correct = 0;
@@ -511,7 +488,7 @@ void train(NeuralNetwork* net, NeuralNetworkDevice* dev_net, my_type** images, m
             for (int s = 0; s < NUM_STREAMS; s++) {
                 if (i+s >= numImages) continue;
                 
-                cudaStreamSynchronize(dev_net->streams[s].stream);
+                CUDA_CHECK(cudaStreamSynchronize(dev_net->streams[s].stream));
                 
                 for (int k = 0; k < OUTPUT_SIZE; k++) {
                     epoch_loss -= labels[i+s][k] * log(output[s][k] + 1e-10);
@@ -526,10 +503,10 @@ void train(NeuralNetwork* net, NeuralNetworkDevice* dev_net, my_type** images, m
             }
         }
 
-        cudaEventRecord(epoch_stop);
-        cudaEventSynchronize(epoch_stop);
+        CUDA_CHECK(cudaEventRecord(epoch_stop));
+        CUDA_CHECK(cudaEventSynchronize(epoch_stop));
         float epoch_ms = 0;
-        cudaEventElapsedTime(&epoch_ms, epoch_start, epoch_stop);
+        CUDA_CHECK(cudaEventElapsedTime(&epoch_ms, epoch_start, epoch_stop));
         
         printf("Epoch %d - Loss: %.4f - Accuracy: %.2f%% - Time: %.3fs\n",
               epoch+1, 
@@ -537,42 +514,42 @@ void train(NeuralNetwork* net, NeuralNetworkDevice* dev_net, my_type** images, m
               (correct*100.0)/numImages,
               epoch_ms/1000.0f);
 
-        cudaEventDestroy(epoch_start);
-        cudaEventDestroy(epoch_stop);
+        CUDA_CHECK(cudaEventDestroy(epoch_start));
+        CUDA_CHECK(cudaEventDestroy(epoch_stop));
     }
 
-    cudaEventRecord(total_stop);
-    cudaEventSynchronize(total_stop);
+    CUDA_CHECK(cudaEventRecord(total_stop));
+    CUDA_CHECK(cudaEventSynchronize(total_stop));
     float total_ms = 0;
-    cudaEventElapsedTime(&total_ms, total_start, total_stop);
+    CUDA_CHECK(cudaEventElapsedTime(&total_ms, total_start, total_stop));
     
     printf("Total training time: %.3fs\n", total_ms/1000.0f);
 
     for (int i = 0; i < NUM_STREAMS; i++) {
-        cudaFreeHost(hidden[i]);
-        cudaFreeHost(output[i]);
+        CUDA_CHECK(cudaFreeHost(hidden[i]));
+        CUDA_CHECK(cudaFreeHost(output[i]));
     }
     
-    cudaEventDestroy(total_start);
-    cudaEventDestroy(total_stop);
+    CUDA_CHECK(cudaEventDestroy(total_start));
+    CUDA_CHECK(cudaEventDestroy(total_stop));
 }
 
 void evaluate(NeuralNetworkDevice* dev_net, my_type** images, my_type** labels, int numImages) {
     my_type *hidden, *output;
-    cudaMallocHost(&hidden, HIDDEN_SIZE * sizeof(my_type));
-    cudaMallocHost(&output, OUTPUT_SIZE * sizeof(my_type));
+    CUDA_CHECK(cudaMallocHost(&hidden, HIDDEN_SIZE * sizeof(my_type)));
+    CUDA_CHECK(cudaMallocHost(&output, OUTPUT_SIZE * sizeof(my_type)));
     
     int correct = 0;
     int stream_idx = 0; 
     
     cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
-    cudaEventRecord(start);
+    CUDA_CHECK(cudaEventCreate(&start));
+    CUDA_CHECK(cudaEventCreate(&stop));
+    CUDA_CHECK(cudaEventRecord(start));
     
     for (int i = 0; i < numImages; i++) {
         gpu_forward(dev_net, images[i], hidden, output, stream_idx);
-        cudaStreamSynchronize(dev_net->streams[stream_idx].stream);
+        CUDA_CHECK(cudaStreamSynchronize(dev_net->streams[stream_idx].stream));
         
         int pred = 0, actual = 0;
         for (int j = 0; j < OUTPUT_SIZE; j++) {
@@ -582,19 +559,19 @@ void evaluate(NeuralNetworkDevice* dev_net, my_type** images, my_type** labels, 
         if (pred == actual) correct++;
     }
     
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
+    CUDA_CHECK(cudaEventRecord(stop));
+    CUDA_CHECK(cudaEventSynchronize(stop));
     float milliseconds = 0;
-    cudaEventElapsedTime(&milliseconds, start, stop);
+    CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, stop));
     
     printf("Test Accuracy: %.2f%% (Time: %.3fs)\n", 
           (correct / (my_type)numImages) * 100, 
           milliseconds / 1000.0f);
     
-    cudaFreeHost(hidden);
-    cudaFreeHost(output);
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+    CUDA_CHECK(cudaFreeHost(hidden));
+    CUDA_CHECK(cudaFreeHost(output));
+    CUDA_CHECK(cudaEventDestroy(start));
+    CUDA_CHECK(cudaEventDestroy(stop));
 }
 
 my_type** loadMNISTImages(const char* filename, int numImages) {
@@ -637,10 +614,10 @@ my_type** loadMNISTLabels(const char* filename, int numLabels) {
 }
 
 void freeNetwork(NeuralNetwork* net) {
-    free(net->W1);
-    free(net->W2);
-    free(net->b1);
-    free(net->b2);
+    CUDA_CHECK(cudaFreeHost(net->W1));
+    CUDA_CHECK(cudaFreeHost(net->W2));
+    CUDA_CHECK(cudaFreeHost(net->b1));
+    CUDA_CHECK(cudaFreeHost(net->b2));
     free(net);
 }
 
@@ -651,7 +628,6 @@ int main() {
     my_type** train_labels = loadMNISTLabels("../../data/train-labels.idx1-ubyte", 60000);
     my_type** test_images = loadMNISTImages("../../data/t10k-images.idx3-ubyte", 10000);
     my_type** test_labels = loadMNISTLabels("../../data/t10k-labels.idx1-ubyte", 10000);
-
 
     NeuralNetwork* net = createNetwork();
     NeuralNetworkDevice dev_net;
