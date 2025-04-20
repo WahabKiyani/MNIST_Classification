@@ -2,24 +2,35 @@
 
 This project contains a simple neural network (`nn.c`) and a Makefile for compiling, running, and profiling the program using `gprof`.
 
-## Prerequisites
+## Requirements
+**Core:**
+- GCC
+- CUDA Toolkit (V2-V4)
+- OpenACC (V5)
 
-Ensure you have the following installed on your system:
+**Optional Profiling:**
+- gprof
+- gprof2dot
+- Graphviz
+- NVProf
 
-- **GCC** (GNU Compiler Collection)
-- **gprof** (GNU Profiler)
-- **gprof2dot** (for generating call graphs) *(optional)*
-- **Graphviz** (`dot` command) *(optional, required for visualization)*
+## Installation
+```bash
+# Ubuntu/Debian
+sudo apt install gcc nvidia-cuda-toolkit graphviz python3-gprof2dot
 
-You can install missing dependencies using:
-
-```sh
-# Install required tools (Debian/Ubuntu)
-sudo apt update && sudo apt install -y gcc gprof graphviz python3-gprof2dot
-
-# Install required tools (Arch Linux)
-sudo pacman -S gcc gprof graphviz python-gprof2dot
 ```
+
+
+## Implementations Overview
+
+| Version | Description | Key Features |
+|---------|-------------|-------------|
+| **V1**  | Baseline CPU | Sequential execution, reference implementation |
+| **V2**  | Naive GPU   | Basic CUDA port, minimal optimizations |
+| **V3**  | Optimized GPU | Advanced CUDA optimizations (memory hierarchy, occupancy tuning) |
+| **V4**  | Tensor Core  | V3 + NVIDIA Tensor Core acceleration |
+| **V5**  | OpenACC     | Directive-based GPU acceleration |
 
 ## Makefile Targets
 
@@ -28,7 +39,7 @@ sudo pacman -S gcc gprof graphviz python-gprof2dot
 To compile and execute the program:
 
 ```sh
-make
+make run
 ```
 
 This:
@@ -50,7 +61,19 @@ This:
 - Uses `gprof` to generate a human-readable profiling report (`prof_analysis/gprof_analysis.txt`).
 - If `gprof2dot` and `dot` are available, generates a call graph (`prof_analysis/gprof_graph.png`).
 
-### 3. Cleaning the Project
+
+### 3. Profiling with Nvidia nsight System Profiler
+To analyze performance using `nsight`, run:
+```sh
+make nsys
+```
+
+This:
+- Runs `bin/nn.exe` to generate a profiling file.
+-The profiling file could be seen if you have installed nvidia nsight.
+
+
+### 4. Cleaning the Project
 
 To remove compiled files and profiling data:
 
@@ -69,8 +92,20 @@ After running `make gprof`, you will find:
 
 ## Notes
 
-- If `gprof2dot` and `dot` are missing, the script will warn you and skip the graph generation step.
-- Profiling results may vary between runs due to system activity.
+- **Hardware Requirements**:
+  - All GPU versions require NVIDIA CUDA-capable GPU
+  - V4 specifically needs Volta/Turing/Ampere architecture for Tensor Cores
+  - Minimum compute capability: 3.5 (V2-V3), 7.0+ (V4)
 
+- **Performance Considerations**:
+  - Results may vary based on GPU model and driver version
+  - CPU version (V1) serves as baseline for speedup measurements
+  - For accurate benchmarks, run on dedicated hardware
+
+
+- **Troubleshooting**:
+  - Clean builds with `make clean` if encountering issues
+  - Verify CUDA toolkit version matches GPU architecture
+  - OpenACC requires compatible compiler (PGI/NVIDIA HPC SDK)
 ---
 
