@@ -647,10 +647,11 @@ void freeNetwork(NeuralNetwork* net) {
 int main() {
     printf("MNIST Neural Network with Tensor Cores\n");
 
-    my_type** train_images = loadMNISTImages("data/train-images.idx3-ubyte", 60000);
-    my_type** train_labels = loadMNISTLabels("data/train-labels.idx1-ubyte", 60000);
-    my_type** test_images = loadMNISTImages("data/t10k-images.idx3-ubyte", 10000);
-    my_type** test_labels = loadMNISTLabels("data/t10k-labels.idx1-ubyte", 10000);
+    my_type** train_images = loadMNISTImages("../../data/train-images.idx3-ubyte", 60000);
+    my_type** train_labels = loadMNISTLabels("../../data/train-labels.idx1-ubyte", 60000);
+    my_type** test_images = loadMNISTImages("../../data/t10k-images.idx3-ubyte", 10000);
+    my_type** test_labels = loadMNISTLabels("../../data/t10k-labels.idx1-ubyte", 10000);
+
 
     NeuralNetwork* net = createNetwork();
     NeuralNetworkDevice dev_net;
